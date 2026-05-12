@@ -176,7 +176,7 @@ def measureVoltage(adCh, clkPin, dinPin, doutPin, csPin, type):
 # SignalK Delta Push
 # =============================================================================
 
-def build_signalk_delta(voltage1, voltage2, water_level1, water_level2):
+def build_signalk_delta(voltage1, water_level1, water_level2):
     """
     Build a SignalK delta message with battery and tank data.
     
@@ -204,10 +204,6 @@ def build_signalk_delta(voltage1, voltage2, water_level1, water_level2):
                         "value": round(voltage1, 2)
                     },
                     {
-                        "path": "electrical.batteries.house.voltage",
-                        "value": round(voltage2, 2)
-                    },
-                    {
                         "path": "tanks.freshWater.0.currentLevel",
                         "value": water_ratio1
                     },
@@ -231,13 +227,15 @@ def read_and_push(ws):
     # Starter Battery (ADC channel 5)
     voltage1 = measureVoltage(5, CLK, DIN, DOUT, CS, 1)
     # House Battery (ADC channel 4)
-    voltage2 = measureVoltage(4, CLK, DIN, DOUT, CS, 1)
+    # voltage2 = measureVoltage(4, CLK, DIN, DOUT, CS, 1)
 
-    delta = build_signalk_delta(voltage1, voltage2, water1, water2)
+    #delta = build_signalk_delta(voltage1, voltage2, water1, water2)
+    delta = build_signalk_delta(voltage1, watter1, water2)
+
 
     log.info(
-        "Starter: %.2fV | House: %.2fV | Tank1: %.0f%% | Tank2: %.0f%%",
-        voltage1, voltage2, water1, water2
+        "Starter: %.2fV | Tank1: %.0f%% | Tank2: %.0f%%",
+        voltage1, water1, water2
     )
 
     ws.send(json.dumps(delta))
