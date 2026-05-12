@@ -12,6 +12,7 @@
 
 import time
 import json
+import statistics
 import random
 import sys
 import os
@@ -43,7 +44,10 @@ SK_PORT = 3000
 SK_WS_URL = f"ws://{SK_SERVER}:{SK_PORT}/signalk/v1/stream?subscribe=none"
 
 # Update interval in seconds
-UPDATE_INTERVAL = 5
+UPDATE_INTERVAL = 10
+
+# Duration in seconds to collect ADC samples before computing median
+SAMPLE_DURATION = 5
 
 # --- GPIO / Hardware Constants ---
 HIGH = True   # 3.3V level (high)
@@ -148,28 +152,47 @@ def getAnalogData(adCh, CLKPin, DINPin, DOUTPin, CSPin, type):
     return adchvalue
 
 
-def measureWaterLevel(adCh, clkPin, dinPin, doutPin, csPin, type):
-    """Measure water level, averaged over 3 readings."""
-    level = 0
-    if TESTING:
-        level = random.uniform(0, 100)
-    else:
-        for i in range(3):
-            level = level + getAnalogData(adCh, clkPin, dinPin, doutPin, csPin, type)
-        level = level / 3
-    return level
+def collect_samples(duration_seconds):
+    """
+    Collect ADC samples from all active channels over the given duration.
+    Returns a dict with lists of samples per channel:
+      { 'voltage1': [...], 'water1': [...], 'water2': [...] }
+    """
+    samples = {
+        'voltage1': [],
+        'water1': [],
+        'water2': []
+    }
 
-
-def measureVoltage(adCh, clkPin, dinPin, doutPin, csPin, type):
-    """Measure voltage, averaged over 3 readings."""
-    level = 0
     if TESTING:
-        level = random.uniform(11, 14)
-    else:
-        for i in range(3):
-            level = level + getAnalogData(adCh, clkPin, dinPin, doutPin, csPin, type)
-        level = level / 3
-    return level
+        # In testing mode, generate random samples
+        count = max(1, int(duration_seconds / 0.5))  # simulate ~0.5s per reading
+        for _ in range(count):
+            samples['voltage1'].append(random.uniform(11, 14))
+            samples['water1'].append(random.uniform(0, 100))
+            samples['water2'].append(random.uniform(0, 100))
+        return samples
+
+    end_time = time.time() + duration_seconds
+    log.debug("Collecting samples for %d seconds...", duration_seconds)
+
+    while time.time() < end_time:
+        # Read each channel once per loop iteration
+        # Starter Battery (ADC channel 5, type 1 = voltage)
+        samples['voltage1'].append(
+            getAnalogData(5, CLK, DIN, DOUT, CS, 1)
+        )
+        # Water Tank 1 (ADC channel 7, type 2 = water level)
+        samples['water1'].append(
+            getAnalogData(7, CLK, DIN, DOUT, CS, 2)
+        )
+        # Water Tank 2 (ADC channel 6, type 2 = water level)
+        samples['water2'].append(
+            getAnalogData(6, CLK, DIN, DOUT, CS, 2)
+        )
+
+    log.debug("Collected %d samples per channel", len(samples['voltage1']))
+    return samples
 
 
 # =============================================================================
@@ -182,7 +205,6 @@ def build_signalk_delta(voltage1, water_level1, water_level2):
     
     SignalK paths used:
       - electrical.batteries.starter.voltage      (Volts)
-      - electrical.batteries.house.voltage         (Volts)
       - tanks.freshWater.0.currentLevel            (ratio 0.0 - 1.0)
       - tanks.freshWater.1.currentLevel            (ratio 0.0 - 1.0)
     """
@@ -219,25 +241,21 @@ def build_signalk_delta(voltage1, water_level1, water_level2):
 
 
 def read_and_push(ws):
-    """Read all sensors and push a delta update to SignalK."""
-    # Water Tank 1 (ADC channel 7)
-    water1 = measureWaterLevel(7, CLK, DIN, DOUT, CS, 2)
-    # Water Tank 2 (ADC channel 6)
-    water2 = measureWaterLevel(6, CLK, DIN, DOUT, CS, 2)
-    # Starter Battery (ADC channel 5)
-    voltage1 = measureVoltage(5, CLK, DIN, DOUT, CS, 1)
-    # House Battery (ADC channel 4)
-    # voltage2 = measureVoltage(4, CLK, DIN, DOUT, CS, 1)
+    """Collect ADC samples over SAMPLE_DURATION seconds, compute medians, and push to SignalK."""
+    log.info("Sampling sensors for %d seconds...", SAMPLE_DURATION)
+    samples = collect_samples(SAMPLE_DURATION)
 
-    #delta = build_signalk_delta(voltage1, voltage2, water1, water2)
-    delta = build_signalk_delta(voltage1, watter1, water2)
-
+    # Compute median for each value
+    voltage1 = statistics.median(samples['voltage1'])
+    water1 = statistics.median(samples['water1'])
+    water2 = statistics.median(samples['water2'])
 
     log.info(
-        "Starter: %.2fV | Tank1: %.0f%% | Tank2: %.0f%%",
-        voltage1, water1, water2
+        "Median values — Starter: %.2fV | Tank1: %.0f%% | Tank2: %.0f%% (from %d samples)",
+        voltage1, water1, water2, len(samples['voltage1'])
     )
 
+    delta = build_signalk_delta(voltage1, water1, water2)
     ws.send(json.dumps(delta))
     log.debug("Delta sent to SignalK")
 
