@@ -1,273 +1,356 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from flask import Flask, request
-from flask_restful import Resource, Api
-from json import dumps
-#from flask.ext.jsonpify import jsonify
+#
+# solva_server_signalk.py
+#
+# Reads sensor data from MCP3208 ADC (starter battery voltage, 
+# second battery voltage, two water tank levels) and pushes the
+# values to a local SignalK server via WebSocket delta messages.
+#
+# Based on solva_server.py - BMP085 support removed, Flask REST 
+# service replaced with SignalK delta push.
 
-# import required modules
 import time
-import csv
-import RPi.GPIO as GPIO
+import json
 import random
 import sys
 import os
-import re
-import socket
-from Adafruit_BMP085 import BMP085
-
-#redirect print to file
-#f = open('/var/log/solva_server.log', 'w')
-#sys.stdout = f
-#sys.stderr = f
-print("-" * 25)
-print("Solva Server started")
-print("-" * 25)
-
-#Suppress flask http logging
+import signal
 import logging
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+import websocket
 
-app = Flask(__name__)
-api = Api(app)
-
-HIGH = True  # 3,3V Pegel (high)
-LOW  = False # 0V Pegel (low)
-
+# Only import GPIO when not in testing mode
 TESTING = 0
-#TESTING = 0
 
-# define file names
-tSensorPath = "/sys/bus/w1/devices/10-000802b3c6af/w1_slave"
+if not TESTING:
+    import RPi.GPIO as GPIO
 
-#define constants for watertanks
-waterMax1=2
-waterMin1=20
-waterMax2=2
-waterMin2=33
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
 
-# define GPIO pins for echo sensors
+print("-" * 40)
+print("Solva Server (SignalK) started")
+print("-" * 40)
+
+# --- SignalK Configuration ---
+SK_SERVER = "127.0.0.1"
+SK_PORT = 3000
+SK_WS_URL = f"ws://{SK_SERVER}:{SK_PORT}/signalk/v1/stream?subscribe=none"
+
+# Update interval in seconds
+UPDATE_INTERVAL = 5
+
+# --- GPIO / Hardware Constants ---
+HIGH = True   # 3.3V level (high)
+LOW  = False  # 0V level (low)
+
+# GPIO pins for echo sensors (kept for GPIO setup)
 gpioTrigger1 = 23
 gpioEcho1    = 18
 gpioTrigger2 = 25
 gpioEcho2    = 24
 
-#UDP Definitions
-UDP_IP = "127.0.0.1"
-UDP_PORT = 5005
+# GPIO pins for MCP3208 AD converter
+CLK  = 6   # Clock
+DOUT = 13  # Digital out
+DIN  = 19  # Digital in
+CS   = 26  # Chip-Select
+
+# --- Water Tank Constants ---
+waterMax1 = 2
+waterMin1 = 20
+waterMax2 = 2
+waterMin2 = 33
 
 
-# define GPIO pins for AD converter
-CLK     = 6 # Clock
-DOUT    = 13  # Digital out
-DIN     = 19 # Digital in
-CS      = 26  # Chip-Select
+# =============================================================================
+# Sensor Reading Functions (preserved from solva_server.py)
+# =============================================================================
 
-class Data(Resource):
-    def get(self):
-      if TESTING:
-        bmp = "TEST"
-      else:
-        bmp = BMP085(0x77)
-
-      waterData1 = self.measureWaterLevel(7, CLK, DIN, DOUT, CS,2)
-      #print ("waterData1: %s" % waterData1)
-
-      waterData2 = self.measureWaterLevel(6, CLK, DIN, DOUT, CS,2) 
-      #print ("waterData2: %s" % waterData2)
-
-      # Batterie 1
-      voltageData1 = self.measureVoltage(5, CLK, DIN, DOUT, CS,1)
-      #print ("voltageData1: %s" % voltageData1)
-      # Batterie 2
-      voltageData2 = self.measureVoltage(4, CLK, DIN, DOUT, CS,1)
-      #print ("voltageData2: %s" % voltageData2)
-      # Temperatur
-      temperatureData = self.measureTemperature(bmp)
-      #print ("temperatureData: %s" % temperatureData)
-      # Luftdruck
-      pressureData = self.measureBarometricPressure(bmp)
-      #print ("pressureData: %s" % pressureData)
-
-      return {'waterData1': waterData1, 'waterData2':waterData2, 'voltageData1':voltageData1, 'voltageData2':voltageData2, 'temperature':temperatureData, 'pressure':pressureData} 
-
-    def getCurrentHour():
-      os.environ['TZ'] = 'Europe/Vienna'
-      time.tzset()  
-      return time.strftime('%H') + ':00:00'
-
-    def getCurrentDay():
-      os.environ['TZ'] = 'Europe/Vienna'
-      time.tzset()
-      return time.strftime('%d/%m/%Y')
-
-    def ConvertVolts(self,data,places,type):
-      volts = (data * 3.3) / float(4095) #convert to volt
-      # now lets calculate the real voltage based on the voltage divider
-      if(type==1):
-        volts = volts*(1800+470)/470
-        volts = round(volts,places)
-      else:
-        waterlevel = 0;
-        r2 = 180 * volts/(5-volts)
-        #print ("R2 = %s" % r2)
-        level = (r2/170) * 100
-        # return level
-        if (level >=90):
-          waterlevel = 100
-        elif (level >= 80):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 90
-        elif (level >= 70):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 80
-        elif (level >= 60):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 70
-        elif (level >= 50):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 60
-        elif (level >= 40):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 50
-        elif (level >= 30):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 40
-        elif (level >= 20):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 30
-        elif (level >= 10):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 20
-        elif (level >= 5):
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 10
+def ConvertVolts(data, places, type):
+    """Convert raw ADC data to voltage or water level percentage."""
+    volts = (data * 3.3) / float(4095)  # convert to volt
+    
+    # Type 1: Voltage divider calculation for battery voltage
+    if type == 1:
+        volts = volts * (1800 + 470) / 470
+        volts = round(volts, places)
+    # Type 2: Resistance-based water level calculation
+    else:
+        waterlevel = 0
+        r2 = 180 * volts / (5 - volts)
+        level = (r2 / 170) * 100
+        
+        if level >= 90:
+            waterlevel = 100
+        elif level >= 80:
+            waterlevel = 90
+        elif level >= 70:
+            waterlevel = 80
+        elif level >= 60:
+            waterlevel = 70
+        elif level >= 50:
+            waterlevel = 60
+        elif level >= 40:
+            waterlevel = 50
+        elif level >= 30:
+            waterlevel = 40
+        elif level >= 20:
+            waterlevel = 30
+        elif level >= 10:
+            waterlevel = 20
+        elif level >= 5:
+            waterlevel = 10
         else:
-          # Value between 2.25 and 1.9
-          # Note: remove constant
-          waterlevel = 0
+            waterlevel = 0
+        
         volts = waterlevel
-        #print(waterlevel)
-      volts = round(volts,places)
-      return volts 
-
-
-    def getAnalogData(self,adCh, CLKPin, DINPin, DOUTPin, CSPin,type):
-      # Pegel definieren
-      GPIO.output(CSPin,   HIGH)    
-      GPIO.output(CSPin,   LOW)
-      GPIO.output(CLKPin, LOW)
-      
-      cmd = adCh
-      cmd |= 0b00011000 # Kommando zum Abruf der Analogwerte des Datenkanals adCh
-  
-      # Bitfolge senden
-      for i in range(5):
-        if (cmd & 0x10): # 4. Bit prnd mit 0 anfangen
-          GPIO.output(DINPin, HIGH)
-        else:
-          GPIO.output(DINPin, LOW)
-          # Clocksignal negative Flanke erzeugen   
-        GPIO.output(CLKPin, HIGH)
-        GPIO.output(CLKPin, LOW)
-        cmd <<= 1 # Bitfolge eine Position nach links verschieben
     
-      # Datenabruf
-      adchvalue = 0 # Wert auf 0 zurzen
-      for i in range(13):
+    volts = round(volts, places)
+    return volts
+
+
+def getAnalogData(adCh, CLKPin, DINPin, DOUTPin, CSPin, type):
+    """Read analog data from MCP3208 ADC on a given channel."""
+    GPIO.output(CSPin, HIGH)
+    GPIO.output(CSPin, LOW)
+    GPIO.output(CLKPin, LOW)
+
+    cmd = adCh
+    cmd |= 0b00011000  # Command to read analog value from channel adCh
+
+    # Send bit sequence
+    for i in range(5):
+        if cmd & 0x10:
+            GPIO.output(DINPin, HIGH)
+        else:
+            GPIO.output(DINPin, LOW)
         GPIO.output(CLKPin, HIGH)
         GPIO.output(CLKPin, LOW)
-        adchvalue <<= 1 # 1 Postition nach links schieben
-        if(GPIO.input(DOUTPin)):
-          adchvalue |= 0x01
-      time.sleep(0.5)
-      adchvalue=self.ConvertVolts(adchvalue,2,type)
-      #print ("Measured Voltage: %s" %adchvalue)
-      return adchvalue
+        cmd <<= 1  # Shift bit sequence one position left
 
-    # function: read and parse sensor data file
-    def measureTemperature(self,bmp):
-      if TESTING:
-        value = random.uniform(20,33)
-      else:
-        value = bmp.readTemperature()
-      return value
+    # Read data
+    adchvalue = 0
+    for i in range(13):
+        GPIO.output(CLKPin, HIGH)
+        GPIO.output(CLKPin, LOW)
+        adchvalue <<= 1
+        if GPIO.input(DOUTPin):
+            adchvalue |= 0x01
 
-	
-    # function: read and parse sensor data file
-    def measureBarometricPressure(self,bmp):
-      value = 0.0
-      if TESTING:
-        value = random.uniform(990,1100)
-      else:
-        value = bmp.readPressure()
-        #print ("Pressure: value from BMP180 is: %s" % value)
-        if value > 0:
-          value = value / 100.0
-          #print("Calc val: %s" % value)
-        else:
-          print ("ERROR: Could not read barometric pressure")
-      return value
+    time.sleep(0.5)
+    adchvalue = ConvertVolts(adchvalue, 2, type)
+    return adchvalue
 
-    def measureWaterLevel(self, adCh, clkPin, dinPin, doutPin, csPin,type):
-      level = 0
-      if TESTING:
-        level = random.uniform(0,100)
-      else:
+
+def measureWaterLevel(adCh, clkPin, dinPin, doutPin, csPin, type):
+    """Measure water level, averaged over 3 readings."""
+    level = 0
+    if TESTING:
+        level = random.uniform(0, 100)
+    else:
         for i in range(3):
-          level = level + self.getAnalogData(adCh, clkPin, dinPin, doutPin, csPin,type)
-          #print(level)
+            level = level + getAnalogData(adCh, clkPin, dinPin, doutPin, csPin, type)
         level = level / 3
-      return level
+    return level
 
-    def measureVoltage(self,adCh, clkPin, dinPin, doutPin, csPin,type):
-      level = 0
-      if TESTING:
-        level = random.uniform(11,14)
-      else:
+
+def measureVoltage(adCh, clkPin, dinPin, doutPin, csPin, type):
+    """Measure voltage, averaged over 3 readings."""
+    level = 0
+    if TESTING:
+        level = random.uniform(11, 14)
+    else:
         for i in range(3):
-          level = level + self.getAnalogData(adCh, clkPin, dinPin, doutPin, csPin,type)
+            level = level + getAnalogData(adCh, clkPin, dinPin, doutPin, csPin, type)
         level = level / 3
-      return level
-  
+    return level
 
 
-api.add_resource(Data, '/data') # Route_1
+# =============================================================================
+# SignalK Delta Push
+# =============================================================================
+
+def build_signalk_delta(voltage1, voltage2, water_level1, water_level2):
+    """
+    Build a SignalK delta message with battery and tank data.
+    
+    SignalK paths used:
+      - electrical.batteries.starter.voltage      (Volts)
+      - electrical.batteries.house.voltage         (Volts)
+      - tanks.freshWater.0.currentLevel            (ratio 0.0 - 1.0)
+      - tanks.freshWater.1.currentLevel            (ratio 0.0 - 1.0)
+    """
+    # Convert water level percentage (0-100) to ratio (0.0-1.0) for SignalK
+    water_ratio1 = round(water_level1 / 100.0, 3)
+    water_ratio2 = round(water_level2 / 100.0, 3)
+
+    delta = {
+        "updates": [
+            {
+                "source": {
+                    "label": "solva-server",
+                    "type": "solva.mcp3208"
+                },
+                "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                "values": [
+                    {
+                        "path": "electrical.batteries.starter.voltage",
+                        "value": round(voltage1, 2)
+                    },
+                    {
+                        "path": "electrical.batteries.house.voltage",
+                        "value": round(voltage2, 2)
+                    },
+                    {
+                        "path": "tanks.freshWater.0.currentLevel",
+                        "value": water_ratio1
+                    },
+                    {
+                        "path": "tanks.freshWater.1.currentLevel",
+                        "value": water_ratio2
+                    }
+                ]
+            }
+        ]
+    }
+    return delta
 
 
-      
+def read_and_push(ws):
+    """Read all sensors and push a delta update to SignalK."""
+    # Water Tank 1 (ADC channel 7)
+    water1 = measureWaterLevel(7, CLK, DIN, DOUT, CS, 2)
+    # Water Tank 2 (ADC channel 6)
+    water2 = measureWaterLevel(6, CLK, DIN, DOUT, CS, 2)
+    # Starter Battery (ADC channel 5)
+    voltage1 = measureVoltage(5, CLK, DIN, DOUT, CS, 1)
+    # House Battery (ADC channel 4)
+    voltage2 = measureVoltage(4, CLK, DIN, DOUT, CS, 1)
+
+    delta = build_signalk_delta(voltage1, voltage2, water1, water2)
+
+    log.info(
+        "Starter: %.2fV | House: %.2fV | Tank1: %.0f%% | Tank2: %.0f%%",
+        voltage1, voltage2, water1, water2
+    )
+
+    ws.send(json.dumps(delta))
+    log.debug("Delta sent to SignalK")
+
+
+# =============================================================================
+# WebSocket Callbacks
+# =============================================================================
+
+def on_open(ws):
+    """Called when WebSocket connection is established."""
+    log.info("Connected to SignalK at %s", SK_WS_URL)
+    log.info("Pushing updates every %d seconds", UPDATE_INTERVAL)
+
+
+def on_message(ws, message):
+    """Called when a message is received from SignalK (e.g. hello message)."""
+    try:
+        data = json.loads(message)
+        if "name" in data:
+            log.info("SignalK server: %s (v%s)", data.get("name"), data.get("version"))
+    except json.JSONDecodeError:
+        pass
+
+
+def on_error(ws, error):
+    """Called on WebSocket error."""
+    log.error("WebSocket error: %s", error)
+
+
+def on_close(ws, close_status, msg):
+    """Called when WebSocket connection is closed."""
+    log.warning("WebSocket connection closed (status=%s, msg=%s)", close_status, msg)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def setup_gpio():
+    """Initialize GPIO pins for the MCP3208 and echo sensors."""
+    GPIO.setmode(GPIO.BCM)
+
+    # Echo sensor pins
+    GPIO.setup(gpioTrigger1, GPIO.OUT)
+    GPIO.setup(gpioEcho1, GPIO.IN)
+    GPIO.setup(gpioTrigger2, GPIO.OUT)
+    GPIO.setup(gpioEcho2, GPIO.IN)
+
+    # MCP3208 ADC pins
+    GPIO.setup(CLK, GPIO.OUT)
+    GPIO.setup(DIN, GPIO.OUT)
+    GPIO.setup(DOUT, GPIO.IN)
+    GPIO.setup(CS, GPIO.OUT)
+
+    # Set trigger to false
+    GPIO.output(gpioTrigger1, False)
+
+    log.info("GPIO initialized")
+
+
+def cleanup_and_exit(signum=None, frame=None):
+    """Clean up GPIO and exit gracefully."""
+    log.info("Shutting down...")
+    if not TESTING:
+        GPIO.cleanup()
+        log.info("GPIO cleaned up")
+    sys.exit(0)
+
+
 if __name__ == '__main__':
-  if not TESTING:
-    
-      # use GPIO pin numbering convention
-      GPIO.setmode(GPIO.BCM)
-      
-      # set up GPIO pins
-      GPIO.setup(gpioTrigger1, GPIO.OUT)
-      GPIO.setup(gpioEcho1, GPIO.IN)
-      GPIO.setup(gpioTrigger2, GPIO.OUT)
-      GPIO.setup(gpioEcho2, GPIO.IN)
-      GPIO.setup(CLK, GPIO.OUT)
-      GPIO.setup(DIN, GPIO.OUT)
-      GPIO.setup(DOUT, GPIO.IN)
-      GPIO.setup(CS,   GPIO.OUT)
-          
-          
-      # set trigger to false
-      GPIO.output(gpioTrigger1, False)
-          
-  app.run(port=5002, threaded=True)
-  # reset GPIO settings if user pressed Ctrl+C
-  print("Execution stopped by user")
-  if not TESTING:
-      GPIO.cleanup()
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+    if not TESTING:
+        setup_gpio()
+
+    # Main loop with reconnection logic
+    while True:
+        try:
+            log.info("Connecting to SignalK at %s ...", SK_WS_URL)
+            ws = websocket.WebSocketApp(
+                SK_WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            # We need to run the sensor loop in parallel with the WebSocket.
+            # Use a simple approach: connect, then loop sending deltas.
+            ws_connection = websocket.create_connection(SK_WS_URL)
+
+            # Read and log the hello message
+            hello = ws_connection.recv()
+            hello_data = json.loads(hello)
+            if "name" in hello_data:
+                log.info("SignalK server: %s (v%s)", 
+                         hello_data.get("name"), hello_data.get("version"))
+
+            log.info("Connected! Pushing updates every %d seconds", UPDATE_INTERVAL)
+
+            # Continuous sensor reading and push loop
+            while True:
+                read_and_push(ws_connection)
+                time.sleep(UPDATE_INTERVAL)
+
+        except (websocket.WebSocketException, ConnectionRefusedError, OSError) as e:
+            log.error("Connection failed: %s", e)
+            log.info("Retrying in 10 seconds...")
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            cleanup_and_exit()
