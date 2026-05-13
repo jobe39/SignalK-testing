@@ -12,6 +12,8 @@ The data read is:
 | DOUT | 13 | Pin 12 |
 | DIN | 19 | Pin 11 |
 | CS | 26 | Pin 10 |
+|VDD,Vref (3,3V) | 1 | Pin 15,16 |
+|5V for resistive sensor | 2 ||
 
 **ADC Channels in use:**
 - **CH5** — Starter battery voltage via a **1800Ω / 470Ω voltage divider** (measures up to ~16V)
