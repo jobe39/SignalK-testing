@@ -4,7 +4,7 @@
 # solva_server_signalk.py
 #
 # Reads sensor data from MCP3208 ADC (starter battery voltage, 
-# second battery voltage, two water tank levels) and pushes the
+# two water tank levels) and pushes the
 # values to a local SignalK server via WebSocket delta messages.
 #
 # Based on solva_server.py - BMP085 support removed, Flask REST 
