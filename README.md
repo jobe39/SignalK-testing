@@ -20,6 +20,3 @@ The data read is:
 - **CH6** — Water Tank 2 via a **resistive sensor** (180Ω series, 5V supply)
 - **CH7** — Water Tank 1 via a **resistive sensor** (180Ω series, 5V supply)
 
-The diagram also documents the **echo sensor GPIOs** (23, 18, 25, 24) which are initialized but not actively used in the SignalK version.
-
-Check out the full diagram artifact — it includes the MCP3208 DIP pinout, voltage divider and water sensor schematics, and a complete GPIO summary table. Let me know if anything needs correction!
