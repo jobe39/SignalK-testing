@@ -77,14 +77,24 @@ waterMin2 = 33
 # =============================================================================
 
 def ConvertVolts(data, places, type):
-    """Convert raw ADC data to voltage or water level percentage."""
+    """Convert raw ADC data to voltage or water level percentage. 
+    The MCP3208 ADC is connected to the Raspberry Pi's SPI interface.
+    The reference voltage is 3.3V.
+    """
     volts = (data * 3.3) / float(4095)  # convert to volt
     
     # Type 1: Voltage divider calculation for battery voltage
     if type == 1:
         volts = volts * (1800 + 470) / 470
         volts = round(volts, places)
-    # Type 2: Resistance-based water level calculation
+    """Type 2: Resistance-based water level calculation. 
+        R2 is the sensor, 180 Ohm is in series with the sensor. 
+        The total resistance is R1+R2 = 180+R2.
+        The voltage divider is connected to a 5V source. 
+        The output voltage is Vout = 5V * R2 / (180+R2).
+        The ADC is connected to the output voltage. 
+        The senser delivers 0 - 190 Ohm, but 170 Ohm showed already as full in our tests
+    """
     else:
         waterlevel = 0
         r2 = 180 * volts / (5 - volts)
